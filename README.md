@@ -7,6 +7,10 @@ A comprehensive React-based testing application for Azure Communication Services
 ![TypeScript](https://img.shields.io/badge/TypeScript-Latest-blue)
 ![Tailwind CSS](https://img.shields.io/badge/Tailwind-4.1.11-blue)
 
+## Screenshots
+
+![Azure Communication Services VoIP Testing Web App](./public/web-app.png)
+
 ## Features
 
 ### Call Types Supported
