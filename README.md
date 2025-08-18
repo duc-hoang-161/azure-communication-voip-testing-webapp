@@ -7,9 +7,13 @@ A comprehensive React-based testing application for Azure Communication Services
 ![TypeScript](https://img.shields.io/badge/TypeScript-Latest-blue)
 ![Tailwind CSS](https://img.shields.io/badge/Tailwind-4.1.11-blue)
 
+## Live Demo
+
+- https://acs-demo.surge.sh
+
 ## Screenshots
 
-<img src="./public/web-app.png" alt="Azure Communication Services VoIP Testing Web App">
+[<img src="./public/web-app.png" alt="Azure Communication Services VoIP Testing Web App">](https://acs-demo.surge.sh)
 
 ## Features
 
@@ -202,22 +206,3 @@ For issues and questions:
 - Check the [Issues](https://github.com/duc-hoang-161/azure-communication-voip-testing-webapp/issues) page
 - Review Azure Communication Services documentation
 - Contact the repository maintainers
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
