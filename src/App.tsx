@@ -14,9 +14,6 @@ import {
 import {
     PhoneIcon,
     PhoneXMarkIcon,
-    SpeakerWaveIcon,
-    VideoCameraIcon,
-    DevicePhoneMobileIcon,
     BookmarkIcon,
     ArrowDownTrayIcon,
     ClockIcon,
@@ -101,6 +98,52 @@ const decodeJWT = (token: string): TokenInfo => {
     }
 };
 
+// Friendly error mapper for ACS startCall/adapter errors
+const explainAcsError = (err: unknown): string => {
+    // Try to pull useful info out of SDK errors without using any
+    const errObj = (typeof err === 'object' && err !== null
+        ? (err as { message?: string; code?: string | number; subCode?: string | number; innerError?: unknown })
+        : undefined) || undefined;
+    const inner = (errObj?.innerError && typeof errObj.innerError === 'object')
+        ? (errObj.innerError as { message?: string; code?: string | number; subCode?: string | number })
+        : undefined;
+    const code = errObj?.code ?? inner?.code;
+    const subCode = errObj?.subCode ?? inner?.subCode;
+    const base = errObj?.message || String(err);
+
+    // Known guidance for startCall 41001
+    if (String(subCode) === '41001') {
+        return (
+            'Start call failed (41001). Check the target and configuration: ' +
+            '- For PSTN, use a valid E.164 number and an Alternate Caller ID you own in the ACS resource with telephony enabled. ' +
+            '- For 1:1, use a valid ACS user ID (8:acs:...) and do not call your own ID.'
+        );
+    }
+
+    if (String(code) === '401' || /401|Unauthorized/i.test(base)) {
+        return 'Authorization failed. The token may be invalid or expired.';
+    }
+
+    if (/expired|token/i.test(base)) {
+        return 'The access token appears to be expired or invalid.';
+    }
+
+    return base;
+};
+
+// Basic validators
+const isValidAcsUserId = (id: string) => /^8:acs:.+/.test(id.trim());
+const isGuid = (v: string) =>
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(
+        v.trim()
+    );
+const toE164 = (num: string): string => {
+    const cleaned = num.replace(/[^\d+]/g, '');
+    if (cleaned.startsWith('+')) return cleaned;
+    return cleaned ? `+${cleaned}` : '';
+};
+const isLikelyE164 = (num: string) => /^\+\d{7,15}$/.test(num);
+
 function App() {
     const [callConfig, setCallConfig] = useState<CallConfig>({
         userId: '',
@@ -155,6 +198,12 @@ function App() {
                 `${participants.removed.length} participant(s) left the call`
             );
             setTimeout(() => setSaveMessage(''), 3000);
+        });
+
+        // Surface adapter errors to the UI with friendly messages
+        adapter.on('error', (e: unknown) => {
+            console.error('Adapter error:', e);
+            setError(explainAcsError(e));
         });
     };
 
@@ -627,6 +676,13 @@ function App() {
             return;
         }
 
+        // Prevent starting a call with an expired token
+        const tokenInfo = decodeJWT(callConfig.token);
+        if (tokenInfo.isValid && tokenInfo.isExpired) {
+            setError('Access token is expired. Please provide a fresh token.');
+            return;
+        }
+
         if (!callConfig.callType || !callConfig.callValue) {
             setError(
                 'Please select a call type and provide the corresponding value'
@@ -634,12 +690,45 @@ function App() {
             return;
         }
 
+        if (callConfig.callType === 'group') {
+            if (!isGuid(callConfig.callValue)) {
+                setError('Invalid Group ID. Expecting a GUID.');
+                return;
+            }
+        }
+
+        // Additional validation per call type
+        if (callConfig.callType === 'oneToOne') {
+            if (callConfig.callValue.trim() === callConfig.userId.trim()) {
+                setError('You cannot place a 1:1 call to yourself.');
+                return;
+            }
+            if (!isValidAcsUserId(callConfig.callValue)) {
+                setError('Invalid ACS User ID. Expected format: 8:acs:...');
+                return;
+            }
+        }
+
         // Validate PSTN call requirements
-        if (callConfig.callType === 'phone' && !callConfig.alternateCallerId) {
-            setError(
-                'Phone Number calls require an Alternate Caller ID (your calling number)'
-            );
-            return;
+        if (callConfig.callType === 'phone') {
+            if (!callConfig.alternateCallerId) {
+                setError(
+                    'Phone Number calls require an Alternate Caller ID (your calling number)'
+                );
+                return;
+            }
+            const targetPhoneNumber = toE164(callConfig.callValue);
+            const callerPhoneNumber = toE164(callConfig.alternateCallerId);
+            if (!isLikelyE164(targetPhoneNumber)) {
+                setError('Enter a valid E.164 phone number for the callee.');
+                return;
+            }
+            if (!isLikelyE164(callerPhoneNumber)) {
+                setError(
+                    'Enter a valid E.164 Alternate Caller ID that you own in ACS.'
+                );
+                return;
+            }
         }
 
         setIsLoading(true);
@@ -670,18 +759,15 @@ function App() {
                     credential,
                     displayName: callConfig.displayName,
                     targetCallees: [
-                        { communicationUserId: callConfig.callValue },
+                        { communicationUserId: callConfig.callValue.trim() },
                     ],
                 });
             } else if (callConfig.callType === 'phone') {
                 // Phone call - ensure phone numbers are properly formatted
-                const targetPhoneNumber = callConfig.callValue.startsWith('+')
-                    ? callConfig.callValue
-                    : `+${callConfig.callValue}`;
-                const callerPhoneNumber =
-                    callConfig.alternateCallerId!.startsWith('+')
-                        ? callConfig.alternateCallerId!
-                        : `+${callConfig.alternateCallerId!}`;
+                const targetPhoneNumber = toE164(callConfig.callValue);
+                const callerPhoneNumber = toE164(
+                    callConfig.alternateCallerId!
+                );
 
                 console.log('PSTN Call Config:', {
                     targetPhoneNumber,
@@ -706,7 +792,7 @@ function App() {
             setIsConnected(true);
         } catch (err) {
             console.error('Call initialization error:', err);
-            setError(`Failed to initialize call: ${err}`);
+            setError(explainAcsError(err));
         } finally {
             setIsLoading(false);
         }
@@ -738,6 +824,34 @@ function App() {
     const handleInputChange = (field: keyof CallConfig, value: string) => {
         setCallConfig((prev) => ({ ...prev, [field]: value }));
     };
+
+    // Derived readiness of configuration (PSTN requires Alternate Caller ID)
+    const isConfigReady = (() => {
+        const tokenInfo = decodeJWT(callConfig.token);
+        const baseReady = Boolean(
+            callConfig.userId &&
+                callConfig.token &&
+                callConfig.displayName &&
+                callConfig.callType &&
+                callConfig.callValue &&
+                (callConfig.callType !== 'phone' || callConfig.alternateCallerId)
+        );
+        if (!baseReady) return false;
+        if (tokenInfo.isValid && tokenInfo.isExpired) return false;
+
+        if (callConfig.callType === 'oneToOne') {
+            return isValidAcsUserId(callConfig.callValue) &&
+                callConfig.callValue.trim() !== callConfig.userId.trim();
+        }
+        if (callConfig.callType === 'phone') {
+            return isLikelyE164(toE164(callConfig.callValue)) &&
+                isLikelyE164(toE164(callConfig.alternateCallerId || ''));
+        }
+        if (callConfig.callType === 'group') {
+            return isGuid(callConfig.callValue);
+        }
+        return true;
+    })();
 
     if (isConnected && callAdapter) {
         return (
@@ -803,32 +917,86 @@ function App() {
                 </div>
             )}
 
-            <div className="max-w-2xl w-full">
+            <div className="max-w-5xl w-full">
                 <div className="bg-white rounded-2xl shadow-xl p-8">
-                    {/* Header */}
-                    <div className="text-center mb-8">
-                        <div className="w-16 h-16 bg-azure-blue-500 rounded-full flex items-center justify-center mx-auto mb-4">
-                            <PhoneIcon className="w-8 h-8 text-white" />
+                    {/* Header -> Compact Top Bar */}
+                    <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                            <div className="w-8 h-8 bg-azure-blue-500 rounded-md flex items-center justify-center">
+                                <PhoneIcon className="w-4 h-4 text-black" />
+                            </div>
+                            <h1 className="text-lg font-semibold text-gray-900">
+                                Azure Communication Services
+                            </h1>
                         </div>
-                        <h1 className="text-3xl font-bold text-gray-900 mb-2">
-                            Azure Communication Services
-                        </h1>
-                        <p className="text-gray-600">
-                            VoIP Call Testing Application
-                        </p>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <button
+                                type="button"
+                                onClick={saveConfiguration}
+                                className="inline-flex items-center gap-2 px-3 py-2 bg-blue-500 hover:bg-blue-600 text-white text-xs font-medium rounded-md transition-colors"
+                            >
+                                <BookmarkIcon className="w-4 h-4" />
+                                Save
+                            </button>
+                            <button
+                                type="button"
+                                onClick={loadConfiguration}
+                                className="inline-flex items-center gap-2 px-3 py-2 bg-green-500 hover:bg-green-600 text-white text-xs font-medium rounded-md transition-colors"
+                            >
+                                <ArrowDownTrayIcon className="w-4 h-4" />
+                                Load
+                            </button>
+                            <button
+                                type="button"
+                                onClick={clearConfiguration}
+                                className="inline-flex items-center gap-2 px-3 py-2 bg-gray-500 hover:bg-gray-600 text-white text-xs font-medium rounded-md transition-colors"
+                            >
+                                Clear
+                            </button>
+                            {!isListening ? (
+                                <button
+                                    type="button"
+                                    onClick={startListeningForCalls}
+                                    disabled={
+                                        !callConfig.userId ||
+                                        !callConfig.token ||
+                                        !callConfig.displayName
+                                    }
+                                    className="inline-flex items-center gap-2 px-3 py-2 bg-purple-500 hover:bg-purple-600 disabled:bg-gray-400 text-white text-xs font-medium rounded-md transition-colors"
+                                >
+                                    <PhoneArrowDownLeftIcon className="w-4 h-4" />
+                                    Listen
+                                </button>
+                            ) : (
+                                <button
+                                    type="button"
+                                    onClick={stopListeningForCalls}
+                                    className="inline-flex items-center gap-2 px-3 py-2 bg-red-500 hover:bg-red-600 text-white text-xs font-medium rounded-md transition-colors"
+                                >
+                                    <PhoneXMarkIcon className="w-4 h-4" />
+                                    Stop
+                                </button>
+                            )}
+                            {isListening && (
+                                <span className="inline-flex items-center gap-1 px-2 py-1 bg-green-100 text-green-700 text-xs font-medium rounded-md">
+                                    <BellIcon className="w-3 h-3 animate-pulse" />
+                                    Listening
+                                </span>
+                            )}
+                        </div>
                     </div>
 
                     {/* Error Message */}
                     {error && (
-                        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg">
-                            <p className="text-red-700 text-sm">{error}</p>
+                        <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-md">
+                            <p className="text-red-700 text-xs">{error}</p>
                         </div>
                     )}
 
                     {/* Save Message */}
                     {saveMessage && (
-                        <div className="mb-6 p-4 bg-green-50 border border-green-200 rounded-lg">
-                            <p className="text-green-700 text-sm">
+                        <div className="mb-3 p-3 bg-green-50 border border-green-200 rounded-md">
+                            <p className="text-green-700 text-xs">
                                 {saveMessage}
                             </p>
                         </div>
@@ -836,10 +1004,10 @@ function App() {
 
                     {/* Call State Indicator */}
                     {callState !== 'None' && currentCall && (
-                        <div className="mb-6 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                        <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-md">
                             <div className="flex items-center gap-2">
                                 <div
-                                    className={`w-3 h-3 rounded-full ${
+                                    className={`w-2.5 h-2.5 rounded-full ${
                                         callState === 'Connected'
                                             ? 'bg-green-500 animate-pulse'
                                             : callState === 'Connecting'
@@ -849,8 +1017,8 @@ function App() {
                                             : 'bg-gray-500'
                                     }`}
                                 ></div>
-                                <p className="text-blue-700 text-sm font-medium">
-                                    Call Status: {callState}
+                                <p className="text-blue-700 text-xs font-medium">
+                                    {callState}
                                     {currentCall && (
                                         <span className="ml-2 text-blue-600">
                                             (ID: {currentCall.id?.slice(0, 8)}
@@ -862,83 +1030,19 @@ function App() {
                         </div>
                     )}
 
-                    {/* Save/Load Configuration Buttons */}
-                    <div className="mb-6 space-y-3">
-                        <div className="flex flex-wrap gap-3">
-                            <button
-                                type="button"
-                                onClick={saveConfiguration}
-                                className="inline-flex items-center gap-2 px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white text-sm font-medium rounded-lg transition-colors"
-                            >
-                                <BookmarkIcon className="w-4 h-4" />
-                                Save Configuration
-                            </button>
-                            <button
-                                type="button"
-                                onClick={loadConfiguration}
-                                className="inline-flex items-center gap-2 px-4 py-2 bg-green-500 hover:bg-green-600 text-white text-sm font-medium rounded-lg transition-colors"
-                            >
-                                <ArrowDownTrayIcon className="w-4 h-4" />
-                                Load Configuration
-                            </button>
-                            <button
-                                type="button"
-                                onClick={clearConfiguration}
-                                className="inline-flex items-center gap-2 px-4 py-2 bg-gray-500 hover:bg-gray-600 text-white text-sm font-medium rounded-lg transition-colors"
-                            >
-                                Clear All
-                            </button>
-                        </div>
-
-                        {/* Incoming Call Controls */}
-                        <div className="flex flex-wrap gap-3">
-                            {!isListening ? (
-                                <button
-                                    type="button"
-                                    onClick={startListeningForCalls}
-                                    disabled={
-                                        !callConfig.userId ||
-                                        !callConfig.token ||
-                                        !callConfig.displayName
-                                    }
-                                    className="inline-flex items-center gap-2 px-4 py-2 bg-purple-500 hover:bg-purple-600 disabled:bg-gray-400 text-white text-sm font-medium rounded-lg transition-colors"
-                                >
-                                    <PhoneArrowDownLeftIcon className="w-4 h-4" />
-                                    Listen for Calls
-                                </button>
-                            ) : (
-                                <button
-                                    type="button"
-                                    onClick={stopListeningForCalls}
-                                    className="inline-flex items-center gap-2 px-4 py-2 bg-red-500 hover:bg-red-600 text-white text-sm font-medium rounded-lg transition-colors"
-                                >
-                                    <PhoneXMarkIcon className="w-4 h-4" />
-                                    Stop Listening
-                                </button>
-                            )}
-
-                            {isListening && (
-                                <div className="inline-flex items-center gap-2 px-4 py-2 bg-green-100 text-green-700 text-sm font-medium rounded-lg">
-                                    <BellIcon className="w-4 h-4 animate-pulse" />
-                                    Listening for calls...
-                                </div>
-                            )}
-                        </div>
-                    </div>
-
                     {/* Configuration Form */}
                     <form
                         onSubmit={(e) => {
                             e.preventDefault();
                             initializeCallAdapter();
                         }}
-                        className="space-y-6"
+                        className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4"
                     >
                         {/* User ID */}
                         <div>
                             <label
                                 htmlFor="userId"
-                                className="block text-sm font-medium text-gray-700 mb-2"
+                                className="block text-xs font-medium text-gray-700 mb-1"
                             >
                                 User ID (Communication User ID) *
                             </label>
@@ -949,17 +1053,17 @@ function App() {
                                 onChange={(e) =>
                                     handleInputChange('userId', e.target.value)
                                 }
-                                placeholder="8:acs:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-                                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors"
+                                placeholder="8:acs:xxxx_resource_xxxx_user"
+                                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors text-sm"
                                 required
                             />
                         </div>
 
                         {/* Access Token */}
-                        <div>
+                        <div className="lg:col-span-2">
                             <label
                                 htmlFor="token"
-                                className="block text-sm font-medium text-gray-700 mb-2"
+                                className="block text-xs font-medium text-gray-700 mb-1"
                             >
                                 Access Token *
                             </label>
@@ -970,12 +1074,10 @@ function App() {
                                     handleInputChange('token', e.target.value)
                                 }
                                 placeholder="eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."
-                                rows={3}
-                                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors resize-none"
+                                rows={2}
+                                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors resize-none text-sm"
                                 required
                             />
-
-                            {/* Token Info Display */}
                             {callConfig.token &&
                                 (() => {
                                     const tokenInfo = decodeJWT(
@@ -987,7 +1089,7 @@ function App() {
                                     ) {
                                         return (
                                             <div
-                                                className={`mt-2 p-3 rounded-lg border ${
+                                                className={`mt-1 p-2 rounded-md border ${
                                                     tokenInfo.isExpired
                                                         ? 'bg-red-50 border-red-200'
                                                         : 'bg-blue-50 border-blue-200'
@@ -995,12 +1097,12 @@ function App() {
                                             >
                                                 <div className="flex items-center gap-2">
                                                     {tokenInfo.isExpired ? (
-                                                        <ExclamationTriangleIcon className="w-4 h-4 text-red-500" />
+                                                        <ExclamationTriangleIcon className="w-3.5 h-3.5 text-red-500" />
                                                     ) : (
-                                                        <ClockIcon className="w-4 h-4 text-blue-500" />
+                                                        <ClockIcon className="w-3.5 h-3.5 text-blue-500" />
                                                     )}
                                                     <span
-                                                        className={`text-sm font-medium ${
+                                                        className={`text-xs font-medium ${
                                                             tokenInfo.isExpired
                                                                 ? 'text-red-700'
                                                                 : 'text-blue-700'
@@ -1012,7 +1114,7 @@ function App() {
                                                     </span>
                                                 </div>
                                                 <div
-                                                    className={`text-xs mt-1 ${
+                                                    className={`text-[11px] mt-0.5 ${
                                                         tokenInfo.isExpired
                                                             ? 'text-red-600'
                                                             : 'text-blue-600'
@@ -1035,14 +1137,14 @@ function App() {
                                         );
                                     } else if (tokenInfo.error) {
                                         return (
-                                            <div className="mt-2 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+                                            <div className="mt-1 p-2 bg-yellow-50 border border-yellow-200 rounded-md">
                                                 <div className="flex items-center gap-2">
-                                                    <ExclamationTriangleIcon className="w-4 h-4 text-yellow-500" />
-                                                    <span className="text-sm font-medium text-yellow-700">
+                                                    <ExclamationTriangleIcon className="w-3.5 h-3.5 text-yellow-500" />
+                                                    <span className="text-xs font-medium text-yellow-700">
                                                         Invalid Token
                                                     </span>
                                                 </div>
-                                                <div className="text-xs mt-1 text-yellow-600">
+                                                <div className="text-[11px] mt-0.5 text-yellow-600">
                                                     {tokenInfo.error}
                                                 </div>
                                             </div>
@@ -1056,7 +1158,7 @@ function App() {
                         <div>
                             <label
                                 htmlFor="displayName"
-                                className="block text-sm font-medium text-gray-700 mb-2"
+                                className="block text-xs font-medium text-gray-700 mb-1"
                             >
                                 Display Name *
                             </label>
@@ -1071,20 +1173,18 @@ function App() {
                                     )
                                 }
                                 placeholder="Your Name"
-                                className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors"
+                                className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors text-sm"
                                 required
                             />
                         </div>
 
-                        {/* Call Type Selection */}
-                        <div className="space-y-4">
-                            <label className="block text-sm font-medium text-gray-700 mb-3">
+                        {/* Call Type + Value */}
+                        <div className="lg:col-span-2">
+                            <label className="block text-xs font-medium text-gray-700 mb-1">
                                 Call Type *
                             </label>
-
-                            {/* Radio Options */}
-                            <div className="space-y-3">
-                                <div className="flex items-center">
+                            <div className="flex flex-wrap items-center gap-6">
+                                <label className="flex items-center gap-2 text-sm">
                                     <input
                                         id="group-call"
                                         name="callType"
@@ -1098,26 +1198,17 @@ function App() {
                                                 'callType',
                                                 e.target.value
                                             );
-                                            if (
-                                                callConfig.callType !== 'group'
-                                            ) {
+                                            if (callConfig.callType !== 'group')
                                                 handleInputChange(
                                                     'callValue',
                                                     ''
                                                 );
-                                            }
                                         }}
                                         className="h-4 w-4 text-azure-blue-600 focus:ring-azure-blue-500 border-gray-300"
                                     />
-                                    <label
-                                        htmlFor="group-call"
-                                        className="ml-3 block text-sm font-medium text-gray-700"
-                                    >
-                                        Group Call
-                                    </label>
-                                </div>
-
-                                <div className="flex items-center">
+                                    Group
+                                </label>
+                                <label className="flex items-center gap-2 text-sm">
                                     <input
                                         id="one-to-one-call"
                                         name="callType"
@@ -1134,24 +1225,17 @@ function App() {
                                             if (
                                                 callConfig.callType !==
                                                 'oneToOne'
-                                            ) {
+                                            )
                                                 handleInputChange(
                                                     'callValue',
                                                     ''
                                                 );
-                                            }
                                         }}
                                         className="h-4 w-4 text-azure-blue-600 focus:ring-azure-blue-500 border-gray-300"
                                     />
-                                    <label
-                                        htmlFor="one-to-one-call"
-                                        className="ml-3 block text-sm font-medium text-gray-700"
-                                    >
-                                        1:1 Call
-                                    </label>
-                                </div>
-
-                                <div className="flex items-center">
+                                    1:1
+                                </label>
+                                <label className="flex items-center gap-2 text-sm">
                                     <input
                                         id="phone-call"
                                         name="callType"
@@ -1165,32 +1249,23 @@ function App() {
                                                 'callType',
                                                 e.target.value
                                             );
-                                            if (
-                                                callConfig.callType !== 'phone'
-                                            ) {
+                                            if (callConfig.callType !== 'phone')
                                                 handleInputChange(
                                                     'callValue',
                                                     ''
                                                 );
-                                            }
                                         }}
                                         className="h-4 w-4 text-azure-blue-600 focus:ring-azure-blue-500 border-gray-300"
                                     />
-                                    <label
-                                        htmlFor="phone-call"
-                                        className="ml-3 block text-sm font-medium text-gray-700"
-                                    >
-                                        Phone Call (PSTN)
-                                    </label>
-                                </div>
+                                    PSTN
+                                </label>
                             </div>
 
-                            {/* Dynamic Input Field */}
                             {callConfig.callType && (
-                                <div className="mt-4">
+                                <div className="mt-2">
                                     <label
                                         htmlFor="callValue"
-                                        className="block text-sm font-medium text-gray-700 mb-2"
+                                        className="block text-xs font-medium text-gray-700 mb-1"
                                     >
                                         {callConfig.callType === 'group' &&
                                             'Group ID *'}
@@ -1222,14 +1297,13 @@ function App() {
                                                     ? '8:acs:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
                                                     : '+1234567890'
                                             }
-                                            className="flex-1 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors"
+                                            className="flex-1 px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors text-sm"
                                             required
                                         />
                                         {callConfig.callType === 'group' && (
                                             <button
                                                 type="button"
                                                 onClick={() => {
-                                                    // Generate a simple UUID-like string
                                                     const uuid =
                                                         'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(
                                                             /[xy]/g,
@@ -1254,7 +1328,7 @@ function App() {
                                                         uuid
                                                     );
                                                 }}
-                                                className="px-4 py-3 bg-gray-100 hover:bg-gray-200 text-gray-700 text-sm rounded-lg transition-colors whitespace-nowrap"
+                                                className="px-3 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 text-xs rounded-md transition-colors whitespace-nowrap"
                                             >
                                                 Generate UUID
                                             </button>
@@ -1262,10 +1336,9 @@ function App() {
                                     </div>
                                     {callConfig.callType === 'group' &&
                                         callConfig.callValue && (
-                                            <p className="text-xs text-gray-600 mt-1">
-                                                💡 Share this Group ID with
-                                                others so they can join the same
-                                                call
+                                            <p className="text-[11px] text-gray-600 mt-1">
+                                                Share this Group ID with others
+                                                so they can join the same call
                                             </p>
                                         )}
                                 </div>
@@ -1274,10 +1347,10 @@ function App() {
 
                         {/* Alternate Caller ID for PSTN calls */}
                         {callConfig.callType === 'phone' && (
-                            <div>
+                            <div className="lg:col-span-2 lg:align-bottom lg:self-end">
                                 <label
                                     htmlFor="alternateCallerId"
-                                    className="block text-sm font-medium text-gray-700 mb-2"
+                                    className="block text-xs font-medium text-gray-700 mb-1"
                                 >
                                     Alternate Caller ID (your calling number) *
                                 </label>
@@ -1291,175 +1364,155 @@ function App() {
                                             e.target.value
                                         )
                                     }
-                                    placeholder="+1987654321"
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors"
+                                    placeholder="+1987654321 Must be a number you own in ACS"
+                                    title="Must be a number you own in ACS (include country code)"
+                                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-azure-blue-500 focus:border-azure-blue-500 transition-colors text-sm"
                                     required
                                 />
-                                <p className="text-sm text-gray-600 mt-1">
-                                    This must be a phone number you own/control
-                                    in Azure Communication Services (with
-                                    country code, e.g., +1234567890)
-                                </p>
                             </div>
                         )}
 
-                        {/* Help Text */}
-                        <div className="space-y-4">
-                            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                                <h3 className="text-sm font-medium text-blue-900 mb-2">
-                                    Configuration Help:
+                        {/* Compact Details Block */}
+                        <div className="lg:col-span-3 xl:col-span-4 mt-1 p-3 bg-gradient-to-r from-blue-50 to-azure-blue-50 border border-blue-200 rounded-md">
+                            <div className="flex items-center justify-between mb-2">
+                                <h3 className="text-xs font-semibold text-blue-900">
+                                    Configuration
                                 </h3>
-                                <ul className="text-sm text-blue-700 space-y-1">
-                                    <li>
-                                        • Select a call type: Group Call, 1:1
-                                        Call, or Phone Call (PSTN)
-                                    </li>
-                                    <li>
-                                        • User ID should be in format:
-                                        8:acs:resource-id_user-id
-                                    </li>
-                                    <li>
-                                        • Access token can be generated from
-                                        Azure Communication Services
-                                    </li>
-                                    <li>
-                                        • Group ID: UUID format for group calls
-                                    </li>
-                                    <li>
-                                        • Target User ID: Azure Communication
-                                        Services user ID for 1:1 calls
-                                    </li>
-                                    <li>
-                                        • Phone Number: Include country code
-                                        (e.g., +1234567890) for PSTN calls
-                                    </li>
-                                    <li>
-                                        • Alternate Caller ID is required for
-                                        PSTN calls - must be a phone number you
-                                        own
-                                    </li>
-                                    <li>
-                                        • Use "Save Configuration" to store your
-                                        settings locally for future use
-                                    </li>
-                                </ul>
+                                <span
+                                    className={`px-2 py-0.5 border rounded-full text-[10px] font-medium ${
+                                        isConfigReady
+                                            ? 'bg-green-50 text-green-700 border-green-200'
+                                            : 'bg-yellow-50 text-yellow-700 border-yellow-200'
+                                    }`}
+                                >
+                                    {isConfigReady ? 'Ready' : 'Incomplete'}
+                                </span>
                             </div>
 
-                            <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
-                                <h3 className="text-sm font-medium text-yellow-900 mb-2">
-                                    ⚠️ Incoming Calls - Important Information:
-                                </h3>
-                                <ul className="text-sm text-yellow-800 space-y-1">
-                                    <li>
-                                        • <strong>Real incoming calls</strong>{' '}
-                                        in Azure Communication Services require
-                                        backend webhooks and push notifications
-                                    </li>
-                                    <li>
-                                        • <strong>Browser limitations:</strong>{' '}
-                                        Web apps cannot directly receive
-                                        incoming calls without server
-                                        integration
-                                    </li>
-                                    <li>
-                                        • <strong>Testing:</strong> Use the
-                                        "Test Incoming Call" button to simulate
-                                        the incoming call experience
-                                    </li>
-                                    <li>
-                                        • <strong>Production setup:</strong>{' '}
-                                        Requires Azure Event Grid, webhooks, and
-                                        push notification services
-                                    </li>
-                                    <li>
-                                        • <strong>Alternative:</strong> Share a
-                                        Group ID with others - everyone joins
-                                        the same group call
-                                    </li>
-                                </ul>
-                            </div>
+                            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
+                                {/* Type */}
+                                <div className="p-2 bg-white rounded border border-blue-100">
+                                    <div className="text-[11px] text-blue-900 font-medium">
+                                        Type
+                                    </div>
+                                    <div className="mt-0.5 text-[11px] text-blue-700">
+                                        {callConfig.callType || 'None'}
+                                    </div>
+                                </div>
 
-                            <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-                                <h3 className="text-sm font-medium text-green-900 mb-2">
-                                    💡 How to Test Calls:
-                                </h3>
-                                <ul className="text-sm text-green-800 space-y-1">
-                                    <li>
-                                        • <strong>Group Calls:</strong> Generate
-                                        a UUID, share it with others, everyone
-                                        joins the same group
-                                    </li>
-                                    <li>
-                                        • <strong>1:1 Calls:</strong> One person
-                                        starts a call to another person's User
-                                        ID
-                                    </li>
-                                    <li>
-                                        • <strong>Phone Calls:</strong> Call
-                                        actual phone numbers (requires Azure
-                                        PSTN setup)
-                                    </li>
-                                    <li>
-                                        • <strong>Multi-device:</strong> Open
-                                        this app in multiple browser tabs with
-                                        different User IDs
-                                    </li>
-                                </ul>
+                                {/* User ID */}
+                                <div className="p-2 bg-white rounded border border-blue-100">
+                                    <div className="text-[11px] text-blue-900 font-medium">
+                                        User ID
+                                    </div>
+                                    <div className="mt-0.5 text-[11px]">
+                                        <span
+                                            className={`inline-flex items-center px-1.5 py-0.5 rounded-full border text-[10px] font-medium ${
+                                                callConfig.userId
+                                                    ? 'bg-green-50 text-green-700 border-green-200'
+                                                    : 'bg-gray-50 text-gray-600 border-gray-200'
+                                            }`}
+                                        >
+                                            {callConfig.userId
+                                                ? 'Set'
+                                                : 'Not set'}
+                                        </span>
+                                        {callConfig.userId && (
+                                            <span
+                                                className="ml-2 text-blue-700 font-mono truncate inline-block max-w-[12rem] align-middle"
+                                                title={callConfig.userId}
+                                            >
+                                                {callConfig.userId}
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Token */}
+                                <div className="p-2 bg-white rounded border border-blue-100">
+                                    <div className="text-[11px] text-blue-900 font-medium">
+                                        Token
+                                    </div>
+                                    <div className="mt-0.5 text-[11px]">
+                                        <span
+                                            className={`inline-flex items-center px-1.5 py-0.5 rounded-full border text-[10px] font-medium ${
+                                                callConfig.token
+                                                    ? 'bg-green-50 text-green-700 border-green-200'
+                                                    : 'bg-gray-50 text-gray-600 border-gray-200'
+                                            }`}
+                                        >
+                                            {callConfig.token
+                                                ? 'Present'
+                                                : 'Not set'}
+                                        </span>
+                                    </div>
+                                </div>
+
+                                {/* Name */}
+                                <div className="p-2 bg-white rounded border border-blue-100">
+                                    <div className="text-[11px] text-blue-900 font-medium">
+                                        Name
+                                    </div>
+                                    <div
+                                        className="mt-0.5 text-[11px] text-blue-700 truncate"
+                                        title={callConfig.displayName || 'None'}
+                                    >
+                                        {callConfig.displayName || 'None'}
+                                    </div>
+                                </div>
+
+                                {/* Value */}
+                                <div className="p-2 bg-white rounded border border-blue-100">
+                                    <div className="text-[11px] text-blue-900 font-medium">
+                                        Value
+                                    </div>
+                                    <div
+                                        className="mt-0.5 text-[11px] text-blue-700 font-mono truncate"
+                                        title={callConfig.callValue || 'None'}
+                                    >
+                                        {callConfig.callValue || 'None'}
+                                    </div>
+                                </div>
+
+                                {/* Alt Caller ID */}
+                                <div className="p-2 bg-white rounded border border-blue-100">
+                                    <div className="text-[11px] text-blue-900 font-medium">
+                                        Alt Caller ID
+                                    </div>
+                                    <div
+                                        className="mt-0.5 text-[11px] text-blue-700 truncate"
+                                        title={
+                                            callConfig.alternateCallerId ||
+                                            'None'
+                                        }
+                                    >
+                                        {callConfig.alternateCallerId || 'None'}
+                                    </div>
+                                </div>
                             </div>
                         </div>
 
                         {/* Start Call Button */}
-                        <button
-                            type="submit"
-                            disabled={isLoading}
-                            className="w-full bg-blue-500 hover:bg-blue-600 cursor-pointer text-white font-semibold py-4 px-6 rounded-lg flex items-center justify-center gap-3 transition-colors"
-                        >
-                            {isLoading ? (
-                                <>
-                                    <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-                                    Connecting...
-                                </>
-                            ) : (
-                                <>
-                                    <PhoneIcon className="w-5 h-5" />
-                                    Start Call
-                                </>
-                            )}
-                        </button>
-                    </form>
-
-                    {/* Features Grid */}
-                    <div className="mt-8 pt-8 border-t border-gray-200">
-                        <h3 className="text-lg font-semibold text-gray-900 mb-4 text-center">
-                            Supported Features
-                        </h3>
-                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                            <div className="text-center p-4 bg-gray-50 rounded-lg">
-                                <PhoneIcon className="w-8 h-8 text-azure-blue-500 mx-auto mb-2" />
-                                <p className="text-sm font-medium text-gray-700">
-                                    Voice Calls
-                                </p>
-                            </div>
-                            <div className="text-center p-4 bg-gray-50 rounded-lg">
-                                <VideoCameraIcon className="w-8 h-8 text-azure-blue-500 mx-auto mb-2" />
-                                <p className="text-sm font-medium text-gray-700">
-                                    Video Calls
-                                </p>
-                            </div>
-                            <div className="text-center p-4 bg-gray-50 rounded-lg">
-                                <SpeakerWaveIcon className="w-8 h-8 text-azure-blue-500 mx-auto mb-2" />
-                                <p className="text-sm font-medium text-gray-700">
-                                    Screen Share
-                                </p>
-                            </div>
-                            <div className="text-center p-4 bg-gray-50 rounded-lg">
-                                <DevicePhoneMobileIcon className="w-8 h-8 text-azure-blue-500 mx-auto mb-2" />
-                                <p className="text-sm font-medium text-gray-700">
-                                    PSTN Calls
-                                </p>
-                            </div>
+                        <div className="lg:col-span-3 xl:col-span-4">
+                            <button
+                                type="submit"
+                                disabled={isLoading || !isConfigReady}
+                                className="w-full bg-blue-500 hover:bg-blue-600 disabled:bg-blue-300 cursor-pointer text-white font-semibold py-3 px-4 rounded-md flex items-center justify-center gap-2 transition-colors"
+                            >
+                                {isLoading ? (
+                                    <>
+                                        <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                                        Connecting...
+                                    </>
+                                ) : (
+                                    <>
+                                        <PhoneIcon className="w-4 h-4" />
+                                        Start Call
+                                    </>
+                                )}
+                            </button>
                         </div>
-                    </div>
+                    </form>
                 </div>
             </div>
         </div>
