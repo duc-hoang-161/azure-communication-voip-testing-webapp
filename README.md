@@ -9,7 +9,7 @@ A comprehensive React-based testing application for Azure Communication Services
 
 ## Screenshots
 
-![Azure Communication Services VoIP Testing Web App](./public/web-app.png)
+<img src="./public/web-app.png" alt="Azure Communication Services VoIP Testing Web App" width="50%">
 
 ## Features
 

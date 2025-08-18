@@ -3,6 +3,9 @@ import {
     CallComposite,
     createAzureCommunicationCallAdapter,
     type CallAdapter,
+    createAzureCommunicationCallAdapterFromClient,
+    createStatefulCallClient,
+    type StatefulCallClient,
 } from '@azure/communication-react';
 import {
     AzureCommunicationTokenCredential,
@@ -22,9 +25,10 @@ import {
     BellIcon,
 } from '@heroicons/react/24/outline';
 import {
-    CallClient,
     type CallAgent,
     type Call,
+    type IncomingCall,
+    IncomingCallKind,
 } from '@azure/communication-calling';
 
 // Types for our configuration
@@ -43,15 +47,6 @@ interface TokenInfo {
     isExpired?: boolean;
     timeUntilExpiry?: string;
     error?: string;
-}
-
-interface IncomingCall {
-    id: string;
-    callerInfo: {
-        displayName?: string;
-        identifier: string;
-    };
-    isVideoCall: boolean;
 }
 
 // Function to decode JWT token
@@ -125,10 +120,43 @@ function App() {
     const [listeningAdapter, setListeningAdapter] = useState<
         CallAdapter | undefined
     >();
-    const [callClient, setCallClient] = useState<CallClient | undefined>();
+    const [callClient, setCallClient] = useState<
+        StatefulCallClient | undefined
+    >();
     const [callAgent, setCallAgent] = useState<CallAgent | undefined>();
     const [callState, setCallState] = useState<string>('None');
     const [currentCall, setCurrentCall] = useState<Call | undefined>(undefined);
+
+    // Helper to wire adapter events in one place
+    const wireAdapterEvents = (adapter: CallAdapter) => {
+        adapter.on('callEnded', () => {
+            console.log('Call ended event received');
+            setSaveMessage('Call ended by the other party');
+            setTimeout(() => setSaveMessage(''), 5000);
+
+            // Return to main form
+            setIsConnected(false);
+            setCallAdapter(undefined);
+            setCurrentCall(undefined);
+            setCallState('None');
+        });
+
+        adapter.on('participantsJoined', (participants) => {
+            console.log('Participants joined:', participants);
+            setSaveMessage(
+                `${participants.joined.length} participant(s) joined the call`
+            );
+            setTimeout(() => setSaveMessage(''), 3000);
+        });
+
+        adapter.on('participantsLeft', (participants) => {
+            console.log('Participants left:', participants);
+            setSaveMessage(
+                `${participants.removed.length} participant(s) left the call`
+            );
+            setTimeout(() => setSaveMessage(''), 3000);
+        });
+    };
 
     // Load saved configuration on component mount
     useEffect(() => {
@@ -344,12 +372,13 @@ function App() {
                 callConfig.token
             );
 
-            // Create a basic call adapter that can be used for incoming calls
-            // Note: Azure Communication Services incoming calls are typically handled
-            // through webhooks and push notifications in production apps
-            const newCallClient = new CallClient();
+            // Create a stateful call client so CallComposite can attach to accepted calls later
+            const newCallClient = createStatefulCallClient({
+                userId: { communicationUserId: callConfig.userId },
+            });
             const newCallAgent = await newCallClient.createCallAgent(
-                credential
+                credential,
+                { displayName: callConfig.displayName }
             );
 
             // Store the call client and call agent in state
@@ -358,19 +387,7 @@ function App() {
 
             newCallAgent.on('incomingCall', ({ incomingCall: call }) => {
                 console.log('Incoming call detected:', call);
-                setIncomingCall({
-                    id: call.id,
-                    callerInfo: {
-                        displayName: call.callerInfo?.displayName || 'Unknown',
-                        identifier:
-                            call.callerInfo?.identifier?.kind ===
-                            'communicationUser'
-                                ? call.callerInfo?.identifier
-                                      ?.communicationUserId || ''
-                                : '',
-                    },
-                    isVideoCall: false,
-                });
+                setIncomingCall(call);
             });
             newCallAgent.on('callsUpdated', ({ added, removed }) => {
                 console.log('Calls updated:', { added, removed });
@@ -486,21 +503,52 @@ function App() {
         }
     };
 
-    // Join an incoming call by Group ID (simulated incoming call)
-    const joinIncomingCall = async (groupId: string) => {
-        if (
-            !callConfig.userId ||
-            !callConfig.token ||
-            !callConfig.displayName
-        ) {
-            setError('Please fill in User ID, Token, and Display Name');
-            return;
-        }
+    // Helper to map an accepted Call to a CallAdapterLocator supported by UI lib
+    const getAdapterLocatorFromCall = (call: Call) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const info: any = (call as unknown as { info?: unknown }).info;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const rawLocator: any = (info as any)?.callLocator ?? info;
+        if (!rawLocator) return undefined;
+        if (rawLocator.groupId) return { groupId: rawLocator.groupId } as const;
+        if (rawLocator.meetingLink)
+            return { meetingLink: rawLocator.meetingLink } as const;
+        if (rawLocator.roomId) return { roomId: rawLocator.roomId } as const;
+        return undefined;
+    };
 
+    // Create adapter for an accepted incoming call using call locator
+    const createAdapterForAcceptedCall = async (acceptedCall: Call) => {
         try {
             setIsLoading(true);
             setError('');
 
+            const adapterLocator = getAdapterLocatorFromCall(acceptedCall);
+            if (!adapterLocator) {
+                throw new Error(
+                    'Unsupported incoming call type. Only group/meeting/room calls are supported in this sample.'
+                );
+            }
+
+            // Prefer reusing the existing client/agent if available
+            if (callClient && callAgent) {
+                const adapter =
+                    await createAzureCommunicationCallAdapterFromClient(
+                        callClient,
+                        callAgent,
+                        adapterLocator
+                    );
+
+                setCallAdapter(adapter);
+                wireAdapterEvents(adapter);
+                setIsConnected(true);
+                setIsListening(false);
+                setCurrentCall(acceptedCall);
+                setCallState(acceptedCall.state);
+                return;
+            }
+
+            // Fallback to creating fresh client/agent
             const credential = new AzureCommunicationTokenCredential(
                 callConfig.token
             );
@@ -512,30 +560,42 @@ function App() {
                 userId,
                 credential,
                 displayName: callConfig.displayName,
-                locator: { groupId },
+                locator: adapterLocator,
             });
 
             setCallAdapter(adapter);
+            wireAdapterEvents(adapter);
             setIsConnected(true);
             setIsListening(false);
+            setCurrentCall(acceptedCall);
+            setCallState(acceptedCall.state);
         } catch (err) {
-            console.error('Failed to join incoming call:', err);
+            console.error('Failed to create adapter for accepted call:', err);
             setError(`Failed to join call: ${err}`);
         } finally {
             setIsLoading(false);
         }
     };
 
-    // Accept incoming call (placeholder for future webhook integration)
+    // Accept incoming call
     const acceptIncomingCall = async () => {
         if (!incomingCall) return;
-        // This would typically be handled by joining a specific call/group
-        await joinIncomingCall(incomingCall.id);
-        setIncomingCall(null);
+        try {
+            setIsLoading(true);
+            const call = await incomingCall.accept();
+            await createAdapterForAcceptedCall(call);
+            setIncomingCall(null);
+        } catch (err) {
+            console.error('Failed to accept incoming call:', err);
+            setError(`Failed to accept call: ${err}`);
+        } finally {
+            setIsLoading(false);
+        }
     };
 
     // Reject incoming call
     const rejectIncomingCall = async () => {
+        await incomingCall?.reject();
         setIncomingCall(null);
         setSaveMessage('Call rejected');
         setTimeout(() => setSaveMessage(''), 3000);
@@ -635,43 +695,14 @@ function App() {
                     credential,
                     displayName: callConfig.displayName,
                     targetCallees: [{ phoneNumber: targetPhoneNumber }],
-                    alternateCallerId: '+18882869880',
+                    alternateCallerId: callerPhoneNumber,
                 });
             } else {
                 throw new Error('No valid call target specified');
             }
 
             setCallAdapter(adapter);
-
-            // Add event listeners to track call state changes
-            adapter.on('callEnded', () => {
-                console.log('Call ended event received');
-                setSaveMessage('Call ended by the other party');
-                setTimeout(() => setSaveMessage(''), 5000);
-
-                // Return to main form
-                setIsConnected(false);
-                setCallAdapter(undefined);
-                setCurrentCall(undefined);
-                setCallState('None');
-            });
-
-            adapter.on('participantsJoined', (participants) => {
-                console.log('Participants joined:', participants);
-                setSaveMessage(
-                    `${participants.joined.length} participant(s) joined the call`
-                );
-                setTimeout(() => setSaveMessage(''), 3000);
-            });
-
-            adapter.on('participantsLeft', (participants) => {
-                console.log('Participants left:', participants);
-                setSaveMessage(
-                    `${participants.removed.length} participant(s) left the call`
-                );
-                setTimeout(() => setSaveMessage(''), 3000);
-            });
-
+            wireAdapterEvents(adapter);
             setIsConnected(true);
         } catch (err) {
             console.error('Call initialization error:', err);
@@ -747,9 +778,10 @@ function App() {
                                 {incomingCall.callerInfo.displayName}
                             </p>
                             <p className="text-sm text-gray-500 mb-6">
-                                {incomingCall.isVideoCall
-                                    ? 'Video Call'
-                                    : 'Voice Call'}
+                                {incomingCall.kind ===
+                                IncomingCallKind.IncomingCall
+                                    ? 'VoIP Call'
+                                    : 'Teams Call'}
                             </p>
 
                             <div className="flex gap-4 justify-center">
@@ -886,33 +918,10 @@ function App() {
                             )}
 
                             {isListening && (
-                                <>
-                                    <div className="inline-flex items-center gap-2 px-4 py-2 bg-green-100 text-green-700 text-sm font-medium rounded-lg">
-                                        <BellIcon className="w-4 h-4 animate-pulse" />
-                                        Listening for calls...
-                                    </div>
-
-                                    {/* Test Incoming Call Button */}
-                                    <button
-                                        type="button"
-                                        onClick={() => {
-                                            // Simulate an incoming call for testing
-                                            setIncomingCall({
-                                                id: 'test-group-' + Date.now(),
-                                                callerInfo: {
-                                                    displayName: 'Test Caller',
-                                                    identifier:
-                                                        '8:acs:test-caller-id',
-                                                },
-                                                isVideoCall: false,
-                                            });
-                                        }}
-                                        className="inline-flex items-center gap-2 px-4 py-2 bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium rounded-lg transition-colors"
-                                    >
-                                        <BellIcon className="w-4 h-4" />
-                                        Test Incoming Call
-                                    </button>
-                                </>
+                                <div className="inline-flex items-center gap-2 px-4 py-2 bg-green-100 text-green-700 text-sm font-medium rounded-lg">
+                                    <BellIcon className="w-4 h-4 animate-pulse" />
+                                    Listening for calls...
+                                </div>
                             )}
                         </div>
                     </div>
