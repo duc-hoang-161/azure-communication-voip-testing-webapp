@@ -101,12 +101,23 @@ const decodeJWT = (token: string): TokenInfo => {
 // Friendly error mapper for ACS startCall/adapter errors
 const explainAcsError = (err: unknown): string => {
     // Try to pull useful info out of SDK errors without using any
-    const errObj = (typeof err === 'object' && err !== null
-        ? (err as { message?: string; code?: string | number; subCode?: string | number; innerError?: unknown })
-        : undefined) || undefined;
-    const inner = (errObj?.innerError && typeof errObj.innerError === 'object')
-        ? (errObj.innerError as { message?: string; code?: string | number; subCode?: string | number })
-        : undefined;
+    const errObj =
+        (typeof err === 'object' && err !== null
+            ? (err as {
+                  message?: string;
+                  code?: string | number;
+                  subCode?: string | number;
+                  innerError?: unknown;
+              })
+            : undefined) || undefined;
+    const inner =
+        errObj?.innerError && typeof errObj.innerError === 'object'
+            ? (errObj.innerError as {
+                  message?: string;
+                  code?: string | number;
+                  subCode?: string | number;
+              })
+            : undefined;
     const code = errObj?.code ?? inner?.code;
     const subCode = errObj?.subCode ?? inner?.subCode;
     const base = errObj?.message || String(err);
@@ -765,9 +776,7 @@ function App() {
             } else if (callConfig.callType === 'phone') {
                 // Phone call - ensure phone numbers are properly formatted
                 const targetPhoneNumber = toE164(callConfig.callValue);
-                const callerPhoneNumber = toE164(
-                    callConfig.alternateCallerId!
-                );
+                const callerPhoneNumber = toE164(callConfig.alternateCallerId!);
 
                 console.log('PSTN Call Config:', {
                     targetPhoneNumber,
@@ -834,18 +843,23 @@ function App() {
                 callConfig.displayName &&
                 callConfig.callType &&
                 callConfig.callValue &&
-                (callConfig.callType !== 'phone' || callConfig.alternateCallerId)
+                (callConfig.callType !== 'phone' ||
+                    callConfig.alternateCallerId)
         );
         if (!baseReady) return false;
         if (tokenInfo.isValid && tokenInfo.isExpired) return false;
 
         if (callConfig.callType === 'oneToOne') {
-            return isValidAcsUserId(callConfig.callValue) &&
-                callConfig.callValue.trim() !== callConfig.userId.trim();
+            return (
+                isValidAcsUserId(callConfig.callValue) &&
+                callConfig.callValue.trim() !== callConfig.userId.trim()
+            );
         }
         if (callConfig.callType === 'phone') {
-            return isLikelyE164(toE164(callConfig.callValue)) &&
-                isLikelyE164(toE164(callConfig.alternateCallerId || ''));
+            return (
+                isLikelyE164(toE164(callConfig.callValue)) &&
+                isLikelyE164(toE164(callConfig.alternateCallerId || ''))
+            );
         }
         if (callConfig.callType === 'group') {
             return isGuid(callConfig.callValue);
